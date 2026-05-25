@@ -1,0 +1,44 @@
+{
+  "mappings": [
+    {
+      "source": "DDS", "sink": "ZENOH",
+      "message_type": "STD_MSGS_MSG_STRING", "qos": "RELIABLE",
+      "topic": "rt/example_d2z", "zenoh_key": "example/d2z",
+      "bench_mode": true
+    },
+    {
+      "source": "ZENOH", "sink": "DDS",
+      "message_type": "STD_MSGS_MSG_STRING", "qos": "RELIABLE",
+      "topic": "rt/example_z2d", "zenoh_key": "example/z2d",
+      "bench_mode": true
+    },
+    {
+      "source": "DDS", "sink": "SOMEIP",
+      "message_type": "STD_MSGS_MSG_STRING", "qos": "RELIABLE",
+      "topic": "rt/example_d2s",
+      "service_id": 4660, "instance_id": 1, "eventgroup_id": 1, "event_id": 32769,
+      "bench_mode": true
+    },
+    {
+      "source": "SOMEIP", "sink": "DDS",
+      "message_type": "STD_MSGS_MSG_STRING", "qos": "RELIABLE",
+      "topic": "rt/example_s2d",
+      "service_id": 4661, "instance_id": 1, "eventgroup_id": 1, "event_id": 32770,
+      "bench_mode": true
+    },
+    {
+      "source": "ZENOH", "sink": "SOMEIP",
+      "message_type": "STD_MSGS_MSG_STRING", "qos": "RELIABLE",
+      "zenoh_key": "example/z2s",
+      "service_id": 4662, "instance_id": 1, "eventgroup_id": 1, "event_id": 32771,
+      "bench_mode": true
+    },
+    {
+      "source": "SOMEIP", "sink": "ZENOH",
+      "message_type": "STD_MSGS_MSG_STRING", "qos": "RELIABLE",
+      "zenoh_key": "example/s2z",
+      "service_id": 4663, "instance_id": 1, "eventgroup_id": 1, "event_id": 32772,
+      "bench_mode": true
+    }
+  ]
+}

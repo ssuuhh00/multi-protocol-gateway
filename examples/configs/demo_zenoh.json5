@@ -1,0 +1,16 @@
+// Demo-side Zenoh config: peer that connects to the gateway's listening port
+// instead of binding its own. Pairs with gateway_zenoh.json5 in this folder,
+// which listens on tcp/0.0.0.0:7447.
+{
+  "mode": "peer",
+  "connect": {
+    "endpoints": [
+      "tcp/127.0.0.1:7447"
+    ]
+  },
+  "scouting": {
+    "multicast": {
+      "enabled": false
+    }
+  }
+}

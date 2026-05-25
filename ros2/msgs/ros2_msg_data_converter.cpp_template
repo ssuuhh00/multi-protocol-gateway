@@ -1,0 +1,25 @@
+/**
+ * @file ros2_msg_data_converter.cpp_template
+ * @brief Template for user-implemented message logic.
+ * 
+ * Copy these functions into src/ros2_msg_data_converter.cpp (or a similarly named file)
+ * to implement your data conversion logic. This file will be overwritten on generation.
+ */
+
+#include "ros2_msg_data_converter.hpp"
+
+// --- std_msgs::msg::String ---
+
+bool payloadToMsg_std_msgs_msg_String(const std::vector<uint8_t>& payload, void* msg) {
+    auto* string_msg = static_cast<std_msgs::msg::String*>(msg);
+    // [TODO: User Implementation]
+    return true;
+}
+
+std::vector<uint8_t> msgToPayload_std_msgs_msg_String(void* msg) {
+    auto* string_msg = static_cast<std_msgs::msg::String*>(msg);
+    std::vector<uint8_t> payload;
+    // [TODO: User Implementation]
+    return payload;
+}
+

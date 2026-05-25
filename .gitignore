@@ -1,0 +1,9 @@
+build/
+**/build/
+*.o
+bin/
+examples/logs/
+/logs/
+/.baseline/
+__pycache__/
+.vscode/

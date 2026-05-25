@@ -1,0 +1,16 @@
+{
+  "mappings": [
+    {
+      "source": "SOMEIP",
+      "sink": "DDS",
+      "message_type": "STD_MSGS_MSG_STRING",
+      "qos": "RELIABLE",
+      "topic": "rt/example_s2d",
+      "service_id": 4661,
+      "instance_id": 1,
+      "eventgroup_id": 1,
+      "event_id": 32770,
+      "bench_mode": true
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "mappings": [
+    {
+      "source": "SOMEIP",
+      "sink": "ZENOH",
+      "message_type": "STD_MSGS_MSG_STRING",
+      "qos": "RELIABLE",
+      "zenoh_key": "example/s2z",
+      "service_id": 4663,
+      "instance_id": 1,
+      "eventgroup_id": 1,
+      "event_id": 32772,
+      "bench_mode": true
+    }
+  ]
+}

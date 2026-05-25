@@ -1,0 +1,13 @@
+{
+  "mappings": [
+    {
+      "source": "DDS",
+      "sink": "ZENOH",
+      "message_type": "STD_MSGS_MSG_STRING",
+      "qos": "RELIABLE",
+      "topic": "rt/example_d2z",
+      "zenoh_key": "example/d2z",
+      "bench_mode": true
+    }
+  ]
+}

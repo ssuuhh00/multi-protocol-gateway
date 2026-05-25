@@ -1,0 +1,20 @@
+{
+    "unicast": "127.0.0.1",
+    "logging": {
+        "level": "warning",
+        "console": "true"
+    },
+    "routing": "gateway_app",
+    "applications": [
+        {
+            "name": "demo_app",
+            "id": "0x2222"
+        }
+    ],
+    "service-discovery": {
+        "enable": "true",
+        "multicast": "224.224.224.245",
+        "port": "30490",
+        "protocol": "udp"
+    }
+}
