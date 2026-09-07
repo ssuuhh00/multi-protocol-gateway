@@ -111,6 +111,11 @@ add_library(ext_nodes_demo STATIC
     # Compile gateway's logger_config.cpp here so gateway_demo gets
     # setup_global_logger() without linking the gateway binary.
     ${REPO_ROOT}/src/common/logger_config.cpp
+    # The endpoints build their own middleware options through the same
+    # header-only apply layers the gateway uses (dds/zenoh/someip_qos_apply.hpp),
+    # so both ends of a leg derive the same thing from the same mapping. The
+    # spec sheet itself (qos_spec.cpp) is not needed here: it decides nothing
+    # at runtime, it only says what the gateway builds.
 )
 
 target_include_directories(ext_nodes_demo PUBLIC
@@ -120,8 +125,23 @@ target_include_directories(ext_nodes_demo PUBLIC
     ${ROS2_MSG_DIR}
 )
 
+# Z_FEATURE_UNSTABLE_API: same reasoning as the root CMakeLists, and needed
+# here for the same reason the gateway needs it. The external endpoints declare
+# the mapping's qos_policies on their own side, and four of the five policies
+# ride on Zenoh's Advanced Pub/Sub -- whose option structs are wrapped in
+# `#if defined(Z_FEATURE_UNSTABLE_API)` in zenoh_commons.h. Without the define
+# the endpoint would silently fall back to a plain publisher and the demo would
+# be declaring on one side of the bridge only -- a contract with one signatory.
+if(NOT ZENOHC_BUILD_WITH_UNSTABLE_API)
+    message(FATAL_ERROR
+        "zenohc at ${CMAKE_PREFIX_PATH} was built without the unstable API. "
+        "Rebuild it with -DZENOHC_BUILD_WITH_UNSTABLE_API=ON; the demo's Zenoh "
+        "endpoints declare the same Advanced Pub/Sub policies the gateway does.")
+endif()
+
 target_compile_definitions(ext_nodes_demo PUBLIC
     ZENOHCXX_ZENOHC
+    Z_FEATURE_UNSTABLE_API
 )
 
 target_compile_definitions(ext_nodes_demo PRIVATE
@@ -141,3 +161,18 @@ target_link_libraries(ext_nodes_demo PUBLIC
 
 add_executable(gateway_demo ${EXAMPLES_SRC}/demo.cpp)
 target_link_libraries(gateway_demo PRIVATE ext_nodes_demo)
+
+# queue_policy_test: the bridge queue and the QoS spec sheet, driven directly.
+#
+# It links no middleware: the queue and the spec table are plain C++, and
+# keeping the test free of DDS/Zenoh/vSomeIP is what makes the overflow
+# deterministic instead of dependent on how fast a localhost sink happens to be.
+# discovery_mapping.cpp is compiled in so the test can assert what the mapping
+# parser refuses (a liveliness lease), not only what the table says.
+add_executable(queue_policy_test
+    ${EXAMPLES_SRC}/queue_policy_test.cpp
+    ${REPO_ROOT}/src/common/qos_spec.cpp
+    ${REPO_ROOT}/src/discovery/discovery_mapping.cpp
+)
+target_include_directories(queue_policy_test PRIVATE ${REPO_ROOT}/src ${REPO_ROOT}/third_party ${ROS2_MSG_DIR})
+target_link_libraries(queue_policy_test PRIVATE ros2_msgs_lib Threads::Threads spdlog::spdlog)

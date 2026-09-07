@@ -3,6 +3,7 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include "common/bench_util.hpp"
+#include "dds/dds_qos_apply.hpp"
 #include "ros2_msg_data_converter.hpp"
 
 DDSSubscriber::DDSSubscriber(eprosima::fastdds::dds::DomainParticipant* participant,
@@ -91,6 +92,26 @@ bool DDSSubscriber::handleCreate(const Command& cmd) {
         reader_qos.reliability().kind = eprosima::fastdds::dds::RELIABLE_RELIABILITY_QOS;
     }
     reader_qos.history().depth = 10;
+
+    // Fine-grained policies, if this mapping declared any for its source leg.
+    // Applied after the coarse `qos` above so an explicit reliability wins over
+    // the two-valued field, and skipped entirely when nothing was declared.
+    if (!cmd.qos_policies.empty()) {
+        // sourceLeg(): the declaration minus DEADLINE. A deadline is the sink's
+        // contract (the gateway's writer offers it, the external reader
+        // requests it); requesting one on this reader would show only in this
+        // log while making the external writer's offer a matching condition
+        // (RxO) for nothing in return. See dds_qos_apply.hpp.
+        const QosProfile leg = dds_qos::sourceLeg(cmd.qos_policies);
+        dds_qos::apply(reader_qos, leg);
+        log_->info("Creating: QoS on source leg: {}", dds_qos::describe(leg));
+        if (cmd.qos_policies.reliability && *cmd.qos_policies.reliability == ReliabilityKind::RELIABLE) {
+            // Worth saying out loud: this is the reader *requesting* a contract.
+            // A BEST_EFFORT external writer will not match it, and the bridge
+            // will carry nothing until one that offers RELIABLE appears.
+            log_->warn("Creating: reader requests RELIABLE; a BEST_EFFORT writer will not match this bridge");
+        }
+    }
 
     eprosima::fastdds::dds::Topic* topic = tracker_->getTopicAndAddRef(topic_name);
     if (topic != nullptr) {
@@ -221,6 +242,42 @@ void DDSSubscriber::ReaderListener::on_subscription_matched(
         log_->debug("[Match:{}] Publisher matched (total: {})", topic_name_, info.current_count);
     } else if (info.current_count_change < 0) {
         log_->debug("[Match:{}] Publisher unmatched (total: {})", topic_name_, info.current_count);
+    }
+}
+
+void DDSSubscriber::ReaderListener::on_requested_incompatible_qos(
+    eprosima::fastdds::dds::DataReader* /*reader*/,
+    const eprosima::fastdds::dds::RequestedIncompatibleQosStatus& status) {
+    // The bridge will not carry data across this leg. Say which policy, because
+    // "no data" and "wrong contract" look the same from the outside.
+    log_->error("[QoS:{}] REQUESTED_INCOMPATIBLE_QOS on {} -- no writer offers what this reader requests (count {})",
+                conn_key_, dds_qos::policyName(status.last_policy_id), status.total_count);
+}
+
+void DDSSubscriber::ReaderListener::on_requested_deadline_missed(
+    eprosima::fastdds::dds::DataReader* /*reader*/,
+    const eprosima::fastdds::dds::RequestedDeadlineMissedStatus& status) {
+    // DDS reports a missed deadline; it does not produce the late sample. The
+    // count is the whole contract. This reader requests no deadline
+    // (dds_qos::sourceLeg strips it), so this fires only if that rule is ever
+    // relaxed -- it stays so that a request that does slip through is visible.
+    log_->warn("[QoS:{}] DEADLINE missed on the source leg (total {})", conn_key_, status.total_count);
+}
+
+void DDSSubscriber::ReaderListener::on_liveliness_changed(
+    eprosima::fastdds::dds::DataReader* /*reader*/,
+    const eprosima::fastdds::dds::LivelinessChangedStatus& status) {
+    // Fast DDS tracks a matched writer's liveliness only when THIS reader
+    // requested a finite lease (StatefulReader::matched_writer_add), and the
+    // gateway never asks for one, so this callback stays quiet. The source's loss is
+    // seen in discovery instead -- the writer's removal -- and reported by
+    // DiscoveryManager::onDdsWriterDiscovered, which also deletes the bridge.
+    // Kept so that a reader given a lease by some other path is still visible.
+    if (status.not_alive_count_change > 0) {
+        log_->warn("[QoS:{}] LIVELINESS lost: {} writer(s) no longer asserting", conn_key_,
+                   status.not_alive_count_change);
+    } else if (status.alive_count_change > 0) {
+        log_->info("[QoS:{}] LIVELINESS recovered: {} alive writer(s)", conn_key_, status.alive_count);
     }
 }
 

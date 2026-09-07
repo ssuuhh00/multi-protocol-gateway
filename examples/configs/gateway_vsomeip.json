@@ -16,5 +16,23 @@
         "multicast": "224.224.224.245",
         "port": "30490",
         "protocol": "udp"
-    }
+    },
+    "services": [
+        {
+            "service": "0x1234",
+            "instance": "0x0001",
+            "reliable": {
+                "port": "30511",
+                "enable-magic-cookies": "false"
+            }
+        },
+        {
+            "service": "0x1236",
+            "instance": "0x0001",
+            "reliable": {
+                "port": "30513",
+                "enable-magic-cookies": "false"
+            }
+        }
+    ]
 }

@@ -101,6 +101,7 @@ target_link_libraries(ros2_msgs_lib PUBLIC fastrtps fastcdr fmt)
 set(GATEWAY_SOURCES
     src/gateway/gateway_core.cpp
     src/common/logger_config.cpp
+    src/common/qos_spec.cpp
     src/common/resource_tracker.cpp
     src/dds/dds_publisher.cpp
     src/dds/dds_subscriber.cpp
@@ -130,6 +131,30 @@ target_compile_definitions(multi_protocol_gateway PRIVATE
     ZENOHCXX_ZENOHC
     DEFAULT_LOG_PATH="logs/gateway.log"
 )
+
+# [6-1b] Zenoh unstable API.
+#
+# The installed libzenohc is built with ZENOHC_BUILD_WITH_UNSTABLE_API=ON and
+# exports the ze_advanced_* entry points, but that says nothing about how OUR
+# translation units see the headers: zenoh_commons.h wraps the whole Advanced
+# Pub/Sub surface -- the option structs included -- in
+# `#if defined(Z_FEATURE_UNSTABLE_API)`, and zenoh-cpp's ext/ wrappers do the
+# same. Without this define the types do not exist for us even though the
+# symbols are in the .so, so the QoS policies that ride on AdvancedPublisher /
+# AdvancedSubscriber (history, durability, sample recovery) cannot be reached.
+#
+# zenohcConfig.cmake sets ZENOHC_BUILD_WITH_UNSTABLE_API as a plain variable
+# rather than an INTERFACE compile definition, so it does not propagate through
+# the imported target. Check it and fail loudly rather than silently building a
+# gateway whose Zenoh leg is quietly less capable than the library it links.
+if(NOT ZENOHC_BUILD_WITH_UNSTABLE_API)
+    message(FATAL_ERROR
+        "zenohc at ${CMAKE_PREFIX_PATH} was built without the unstable API. "
+        "Rebuild it with -DZENOHC_BUILD_WITH_UNSTABLE_API=ON; the gateway's "
+        "Zenoh QoS mapping depends on the Advanced Pub/Sub extension.")
+endif()
+
+target_compile_definitions(multi_protocol_gateway PRIVATE Z_FEATURE_UNSTABLE_API)
 
 target_link_libraries(multi_protocol_gateway
     PRIVATE

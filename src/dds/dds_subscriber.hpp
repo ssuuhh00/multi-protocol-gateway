@@ -47,6 +47,20 @@ private:
         void on_subscription_matched(eprosima::fastdds::dds::DataReader* reader,
                                      const eprosima::fastdds::dds::SubscriptionMatchedStatus& info) override;
 
+        // --- QoS contract observation -------------------------------------
+        // Without these three the failure modes of a declared policy are
+        // invisible: an unmatched bridge looks identical to an idle one, and a
+        // missed deadline looks like nothing at all. Reporting them is the
+        // point of declaring a policy in the first place.
+        void on_requested_incompatible_qos(
+            eprosima::fastdds::dds::DataReader* reader,
+            const eprosima::fastdds::dds::RequestedIncompatibleQosStatus& status) override;
+        void on_requested_deadline_missed(
+            eprosima::fastdds::dds::DataReader* reader,
+            const eprosima::fastdds::dds::RequestedDeadlineMissedStatus& status) override;
+        void on_liveliness_changed(eprosima::fastdds::dds::DataReader* reader,
+                                   const eprosima::fastdds::dds::LivelinessChangedStatus& status) override;
+
     private:
         ConnectionQueueMap* queue_map_;
         std::string conn_key_;

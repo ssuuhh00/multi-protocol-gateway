@@ -10,6 +10,12 @@
       "instance_id": 1,
       "eventgroup_id": 1,
       "event_id": 32772,
+      "qos_policies": {
+        "reliability": "RELIABLE",
+        "history": { "kind": "KEEP_LAST", "depth": 16 },
+        "durability": "TRANSIENT_LOCAL",
+        "liveliness": true
+      },
       "bench_mode": true
     }
   ]

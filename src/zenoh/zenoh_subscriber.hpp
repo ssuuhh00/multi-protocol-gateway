@@ -39,10 +39,32 @@ private:
     std::atomic<bool> running_{true};
     std::mutex resource_mutex_;
 
-    std::map<std::string, std::unique_ptr<zenoh::Subscriber<void>>> subscribers_;
+    /**
+     * @brief Holds whichever kind of subscriber this mapping asked for.
+     *
+     * Nothing is called on these after declaration -- the sample callback does
+     * the work and destruction is what undeclares -- so this only has to keep
+     * the right one alive. The miss listener is engaged only for a leg that
+     * declared RELIABLE, and must outlive nothing but its own subscriber.
+     *
+     * The peer's liveliness is NOT watched from here. That watcher decides
+     * whether this subscriber exists at all -- the bridge is created when the
+     * peer's token appears and deleted when it goes -- so it lives one level
+     * up, in DiscoveryManager, beside the DDS and SOME/IP discovery it
+     * parallels.
+     */
+    struct SubscriberEntry {
+        std::unique_ptr<zenoh::Subscriber<void>> plain;
+        std::unique_ptr<zenoh::ext::AdvancedSubscriber<void>> advanced;
+        std::unique_ptr<zenoh::ext::SampleMissListener<void>> miss;
+    };
 
-    // Liveliness tokens are keyed by conn_key (not zenoh_key) so multiple
-    // bridges sharing the same data key each carry their own token.
+    std::map<std::string, SubscriberEntry> subscribers_;
+
+    // Discovery liveliness tokens, under the reserved "@mpg" namespace, keyed by
+    // conn_key (not zenoh_key) so multiple bridges sharing the same data key
+    // each carry their own token. Unrelated to the LIVELINESS QoS policy, which
+    // is declared on the data key expression itself by ZenohPublisher.
     std::map<std::string, zenoh::LivelinessToken> liveliness_tokens_;
 };
 

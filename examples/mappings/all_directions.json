@@ -4,12 +4,24 @@
       "source": "DDS", "sink": "ZENOH",
       "message_type": "STD_MSGS_MSG_STRING", "qos": "RELIABLE",
       "topic": "rt/example_d2z", "zenoh_key": "example/d2z",
+      "qos_policies": {
+        "reliability": "RELIABLE",
+        "history": { "kind": "KEEP_LAST", "depth": 16 },
+        "durability": "TRANSIENT_LOCAL",
+        "liveliness": true
+      },
       "bench_mode": true
     },
     {
       "source": "ZENOH", "sink": "DDS",
       "message_type": "STD_MSGS_MSG_STRING", "qos": "RELIABLE",
       "topic": "rt/example_z2d", "zenoh_key": "example/z2d",
+      "qos_policies": {
+        "reliability": "RELIABLE",
+        "history": { "kind": "KEEP_LAST", "depth": 16 },
+        "durability": "TRANSIENT_LOCAL",
+        "liveliness": true
+      },
       "bench_mode": true
     },
     {
@@ -17,6 +29,12 @@
       "message_type": "STD_MSGS_MSG_STRING", "qos": "RELIABLE",
       "topic": "rt/example_d2s",
       "service_id": 4660, "instance_id": 1, "eventgroup_id": 1, "event_id": 32769,
+      "qos_policies": {
+        "reliability": "RELIABLE",
+        "history": { "kind": "KEEP_LAST", "depth": 16 },
+        "durability": "TRANSIENT_LOCAL",
+        "liveliness": true
+      },
       "bench_mode": true
     },
     {
@@ -24,6 +42,12 @@
       "message_type": "STD_MSGS_MSG_STRING", "qos": "RELIABLE",
       "topic": "rt/example_s2d",
       "service_id": 4661, "instance_id": 1, "eventgroup_id": 1, "event_id": 32770,
+      "qos_policies": {
+        "reliability": "RELIABLE",
+        "history": { "kind": "KEEP_LAST", "depth": 16 },
+        "durability": "TRANSIENT_LOCAL",
+        "liveliness": true
+      },
       "bench_mode": true
     },
     {
@@ -31,6 +55,12 @@
       "message_type": "STD_MSGS_MSG_STRING", "qos": "RELIABLE",
       "zenoh_key": "example/z2s",
       "service_id": 4662, "instance_id": 1, "eventgroup_id": 1, "event_id": 32771,
+      "qos_policies": {
+        "reliability": "RELIABLE",
+        "history": { "kind": "KEEP_LAST", "depth": 16 },
+        "durability": "TRANSIENT_LOCAL",
+        "liveliness": true
+      },
       "bench_mode": true
     },
     {
@@ -38,6 +68,12 @@
       "message_type": "STD_MSGS_MSG_STRING", "qos": "RELIABLE",
       "zenoh_key": "example/s2z",
       "service_id": 4663, "instance_id": 1, "eventgroup_id": 1, "event_id": 32772,
+      "qos_policies": {
+        "reliability": "RELIABLE",
+        "history": { "kind": "KEEP_LAST", "depth": 16 },
+        "durability": "TRANSIENT_LOCAL",
+        "liveliness": true
+      },
       "bench_mode": true
     }
   ]

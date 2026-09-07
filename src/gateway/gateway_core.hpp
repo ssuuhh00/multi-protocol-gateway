@@ -57,6 +57,34 @@ public:
     void logResourceStatus();
 
 private:
+    /**
+     * @brief Print the spec-sheet rows each mapping's declaration selects: for
+     *        every declared policy, what this direction builds on each leg,
+     *        and for one it does not carry, which mechanism is missing.
+     *
+     * Runs once, right after the mapping file is read. Mappings that declared
+     * nothing produce no output at all, so a run without `qos_policies` looks
+     * exactly like the submitted gateway's.
+     *
+     * Nothing is decided here (common/qos_spec.hpp): the table is fixed per
+     * (policy, direction) and this only prints the rows that apply. It never
+     * refuses. A heterogeneous bridge whose two protocols are not equally
+     * expressive is the normal case, not a configuration error; the gateway
+     * builds it, says what it built, and the operator matches the external
+     * nodes to that. What must not happen is accepting a declaration and
+     * quietly ignoring it, which is why a policy the direction does not carry
+     * gets a line naming the mechanism that is missing.
+     */
+    void reportQosSpec();
+
+    /// Emit one summary line per configured queue. Called from deleteBridge()
+    /// for the bridge going away and from shutdown() for whatever is still
+    /// live; ConnectionQueue::summary_logged keeps the second one quiet.
+    /// Queues that declared nothing are silent, so a mapping file with no
+    /// qos_policies produces no QoS output at all.
+    void logQueueSummary(const std::string& key, const std::shared_ptr<ConnectionQueue>& q);
+    void logAllQueueSummaries();
+
     std::shared_ptr<spdlog::logger> log_;
 
     bool validateCommand(Command& cmd);

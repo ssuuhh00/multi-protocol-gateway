@@ -6,6 +6,8 @@
 #include <cctype>
 #include <sstream>
 
+#include "common/qos_spec.hpp"
+
 #include "ros2_msg_list.h"
 #include "ros2_msg_type_registry.hpp"
 
@@ -29,6 +31,7 @@ GatewayCore::GatewayCore() : running_(false) {
     const std::string config_path = mapping_env;
     discovery_mappings_ = loadDiscoveryMappingsFromJson(config_path);
     log_->info("Init: Loaded {} mapping(s) from {}", discovery_mappings_.size(), config_path);
+    reportQosSpec();
 
     bool uses_someip = false;
     for (const auto& m : discovery_mappings_) {
@@ -44,7 +47,33 @@ GatewayCore::GatewayCore() : running_(false) {
     someip_tracker_ = std::make_shared<SomeipResourceTracker>();
 
     try {
+        // Start from the FACTORY default, not from a fresh QoS object.
+        //
+        // create_participant() picks the XML-loaded profile with a POINTER
+        // comparison -- `(&qos == &PARTICIPANT_QOS_DEFAULT) ? default_participant_qos_
+        // : qos` (Fast-DDS DomainParticipantFactory.cpp:163). A locally
+        // constructed DomainParticipantQos is a different object, so handing it
+        // over makes the participant ignore FASTRTPS_DEFAULT_PROFILES_FILE
+        // *entirely* -- and silently, since the file still parses and
+        // load_profiles() still succeeds.
+        //
+        // That matters in practice: pinning DDS to one NIC needs an
+        // interfaceWhiteList, and the XML profile is the only way Fast DDS
+        // accepts one. Without this, external endpoints (which pass
+        // PARTICIPANT_QOS_DEFAULT) honour the whitelist and the gateway does
+        // not -- half a pinned link, from a config file that reads as if it
+        // pinned both ends.
+        //
+        // load_profiles() first because get_default_participant_qos() is a
+        // plain copy of default_participant_qos_ and does NOT load the XML on
+        // its own; create_participant() is what normally triggers it, which is
+        // too late to read the result.
+        auto* dds_factory = eprosima::fastdds::dds::DomainParticipantFactory::get_instance();
+        dds_factory->load_profiles();
         eprosima::fastdds::dds::DomainParticipantQos pqos;
+        dds_factory->get_default_participant_qos(pqos);
+        // The name is ours whatever the profile says: it is how the gateway is
+        // identified in DDS discovery and in every capture we read.
         pqos.name("Gateway");
 
         // Honor ROS_DOMAIN_ID so the gateway can be isolated from a co-located
@@ -58,10 +87,16 @@ GatewayCore::GatewayCore() : running_(false) {
                 log_->warn("Invalid ROS_DOMAIN_ID='{}', falling back to 0", env_domain);
             }
         }
-        log_->info("DDS DomainParticipant domain_id = {}", domain_id);
+        // Say which transports the participant ended up with, because that is
+        // what a profile changes and what a cross-host capture is read against.
+        // "builtin" here means Fast DDS will add its own UDPv4+SHM; a profile
+        // that sets useBuiltinTransports=false and lists a whitelisted UDPv4
+        // shows up as a user transport count of 1.
+        log_->info("DDS DomainParticipant domain_id = {} (profile: {} user transport(s), builtin transports {})",
+                   domain_id, pqos.transport().user_transports.size(),
+                   pqos.transport().use_builtin_transports ? "on" : "off");
 
-        dds_participant_ =
-            eprosima::fastdds::dds::DomainParticipantFactory::get_instance()->create_participant(domain_id, pqos);
+        dds_participant_ = dds_factory->create_participant(domain_id, pqos);
         if (!dds_participant_) {
             throw std::runtime_error("DomainParticipant creation failed");
         }
@@ -144,11 +179,140 @@ GatewayCore::GatewayCore() : running_(false) {
     std::this_thread::sleep_for(std::chrono::seconds(1));
 }
 
+namespace {
+const char* protoName(ProtocolType p) {
+    switch (p) {
+        case ProtocolType::DDS:    return "DDS";
+        case ProtocolType::SOMEIP: return "SOMEIP";
+        case ProtocolType::ZENOH:  return "ZENOH";
+        default:                   return "-";
+    }
+}
+}  // namespace
+
+void GatewayCore::reportQosSpec() {
+    size_t declared_mappings = 0;
+    size_t mappings_with_uncarried = 0;
+
+    for (size_t i = 0; i < discovery_mappings_.size(); ++i) {
+        const Command& cmd = discovery_mappings_[i].cmd_template;
+        const auto spec = qosSpecFor(cmd);
+        if (spec.empty()) {
+            continue;  // nothing declared: stay silent, stay on the old path
+        }
+        ++declared_mappings;
+        const char* dir = directionLabel(cmd.source, cmd.sink);
+        const size_t not_carried = countNotCarried(spec);
+
+        // One line per mapping at info. The per-leg mechanism text below is
+        // reference material -- true, and worth having, but it is read once by
+        // someone who went looking, whereas this line is read every start by
+        // someone who did not. Six mappings used to mean a hundred lines of
+        // prose scrolling past before the first bridge came up.
+        std::string summary;
+        for (const auto& e : spec) {
+            if (!summary.empty()) summary += " ";
+            summary += to_string(e.policy);
+            // describeValue() renders liveliness as "declared", which the
+            // policy name already says.
+            if (e.value != "declared") summary += "=" + e.value;
+            if (!e.cell.carried) summary += "(!)";
+        }
+        const QueueQos qq = queueQosFor(cmd.qos_policies);
+        std::string queue;
+        if (qq.configured()) {
+            queue = qq.max_depth != 0 ? "  (queue: max " + std::to_string(qq.max_depth) + ", oldest discarded)"
+                                      : std::string("  (queue: unbounded)");
+        }
+        log_->info("QoS: mapping[{}] {}->{} ({}): {}{}", i, protoName(cmd.source), protoName(cmd.sink), dir, summary,
+                   queue);
+
+        for (const auto& e : spec) {
+            if (!e.cell.carried) {
+                // warn, not error: a heterogeneous pair whose protocols are not
+                // equally expressive is the ordinary case, and the run is still
+                // a valid one. It has to be visible, not fatal -- and it is the
+                // one thing in this report that must survive at info level,
+                // because it is the difference between "built" and "not built".
+                log_->warn("QoS:   ! {} not carried in {} -- {}", to_string(e.policy), dir,
+                           *e.cell.brief ? e.cell.brief : e.cell.note);
+            }
+            if (*e.cell.source) {
+                log_->debug("QoS:     {} source ({}): {}", to_string(e.policy), protoName(cmd.source), e.cell.source);
+            }
+            if (*e.cell.sink) {
+                log_->debug("QoS:     {} sink ({}): {}", to_string(e.policy), protoName(cmd.sink), e.cell.sink);
+            }
+            if (*e.cell.note) {
+                log_->debug("QoS:     {} note: {}", to_string(e.policy), e.cell.note);
+            }
+        }
+        if (not_carried > 0) {
+            ++mappings_with_uncarried;
+        }
+    }
+
+    if (declared_mappings == 0) {
+        return;
+    }
+    if (mappings_with_uncarried > 0) {
+        log_->info("QoS: {}/{} mapping(s) declare policies; {} declare one their direction does not carry (marked !). "
+                   "Per-leg detail: LOG_LEVEL=debug, or the full table from queue_policy_test --matrix",
+                   declared_mappings, discovery_mappings_.size(), mappings_with_uncarried);
+    } else {
+        log_->info("QoS: {}/{} mapping(s) declare policies; every one is carried in its direction. Per-leg detail: "
+                   "LOG_LEVEL=debug, or the full table from queue_policy_test --matrix",
+                   declared_mappings, discovery_mappings_.size());
+    }
+}
+
+void GatewayCore::logQueueSummary(const std::string& key, const std::shared_ptr<ConnectionQueue>& q) {
+    if (!q) return;
+    // Undeclared queues stay silent: a mapping file with no qos_policies block
+    // must produce no QoS log lines at all, and a summary is a QoS log line.
+    if (!q->configured()) return;
+    if (q->summary_logged.exchange(true)) return;
+
+    // No "| Seq:" field anywhere in this line, deliberately: the bench
+    // analyze.py keeps a log line only when it contains that marker, so a
+    // summary carrying one would be parsed as a latency sample.
+    log_->info("QoS: queue '{}' final: enq {} deq {} drop {} depth {} peak {} held {} B (peak {} B)", key,
+               q->enq_total.load(std::memory_order_relaxed), q->deq_total.load(std::memory_order_relaxed),
+               q->drop_total.load(std::memory_order_relaxed), q->depth.load(std::memory_order_relaxed),
+               q->peak.load(std::memory_order_relaxed), q->bytes_cur.load(std::memory_order_relaxed),
+               q->bytes_peak.load(std::memory_order_relaxed));
+}
+
+void GatewayCore::logAllQueueSummaries() {
+    if (!queue_map_) return;
+    std::vector<std::pair<std::string, std::shared_ptr<ConnectionQueue>>> queues;
+    queue_map_->snapshot(queues);
+    bool any = false;
+    for (const auto& kv : queues) {
+        if (kv.second && kv.second->configured()) {
+            any = true;
+        }
+        logQueueSummary(kv.first, kv.second);
+    }
+    // spdlog here is async and only flushes on error level, and a measurement
+    // harness ends the gateway with SIGTERM followed by SIGKILL a few hundred
+    // milliseconds later. These totals are the only carrier of drop and miss
+    // counts when no observer is attached, so they get flushed rather than
+    // left in the queue for a process that is about to be killed.
+    if (any) log_->flush();
+}
+
 GatewayCore::~GatewayCore() { shutdown(); }
 
 void GatewayCore::shutdown() {
     if (!running_.exchange(false)) return;
     log_->info("Shutdown: Started");
+
+    // Before anything else. These totals are what a run without an observer
+    // has to show for drop and deadline-miss counts, and a harness that sends
+    // SIGTERM and then SIGKILL a few hundred milliseconds later does not leave
+    // room to write them at the end of a four-phase teardown.
+    logAllQueueSummaries();
 
     // DiscoveryManager is only stopped here; its destruction is deferred to
     // the end of this function, after the DDS participant is gone. The
@@ -231,6 +395,18 @@ bool GatewayCore::createBridge(Command& cmd) {
         return false;
     }
 
+    // The queue is created here, after every guard that can still return false
+    // and before the first handler runs. Both a source handler and a sink
+    // handler call queue_map_->create() and either may run first, so a queue
+    // configured inside a backend would be a race with whichever ran earlier;
+    // and a queue created before the guards above would outlive a mapping that
+    // was refused, leaving a key nothing ever removes. Creating it configured
+    // also means an observer can never see it half-set-up.
+    {
+        const QueueQos qq = queueQosFor(cmd.qos_policies);
+        queue_map_->create(key, qq.max_depth, qq.policy);
+    }
+
     if (cmd.sink == ProtocolType::DDS) dds_publisher_->handleCreate(cmd);
     if (cmd.source == ProtocolType::DDS) dds_subscriber_->handleCreate(cmd);
     if (cmd.sink == ProtocolType::SOMEIP) someip_server_->handleCreate(cmd);
@@ -259,10 +435,17 @@ bool GatewayCore::deleteBridge(Command& cmd) {
         log_->error("Deleting: Connection key generation returned empty string");
         return false;
     }
-    if (queue_map_->get(key) == nullptr) {
+    auto going_away = queue_map_->get(key);
+    if (going_away == nullptr) {
         log_->warn("Deleting: Queue does not exist for key '{}'", key);
         return false;
     }
+
+    // Before dispatch: only the *sink* handlers remove a queue, so by the time
+    // they return the counters are gone. A source-only mapping removes nothing
+    // at all and is picked up by the shutdown sweep instead -- which is why the
+    // summary is guarded by a flag rather than by which path reached it.
+    logQueueSummary(key, going_away);
 
     if (cmd.sink == ProtocolType::DDS) dds_publisher_->handleDelete(cmd);
     if (cmd.source == ProtocolType::DDS) dds_subscriber_->handleDelete(cmd);

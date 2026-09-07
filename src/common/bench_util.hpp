@@ -61,10 +61,22 @@ inline uint64_t read_slot(const std::vector<uint8_t>& payload, Slot slot) {
 }
 
 // Prepend a fresh 32B header to payload. SEQ_KEY = seq_key, TS = T_PUB_SEND (now).
-inline void prepend_header(std::vector<uint8_t>& payload, uint64_t seq_key) {
+//
+// Returns the T_PUB_SEND it stamped. The gateway's sink OVERWRITES the TS slot
+// with T_BYTES_LEAVE, so this is the only moment T_PUB_SEND is knowable to the
+// sending side -- and the sender needs to keep it, because it is the only
+// timestamp that can be paired with the receive time WITHOUT crossing a host
+// boundary. Cross-host, the two clocks' epochs differ by the hosts'
+// boot-time difference (measured: ~8 days), so any subtraction spanning them is
+// meaningless. Returning it rather than re-reading the clock at the call site
+// matters because the stamp happens after the payload allocation, which is not
+// free at 512 KB.
+inline int64_t prepend_header(std::vector<uint8_t>& payload, uint64_t seq_key) {
     payload.insert(payload.begin(), HEADER_LEN, static_cast<uint8_t>('0'));
     write_slot(payload, Slot::SEQ_KEY, seq_key);
-    write_slot(payload, Slot::TS, static_cast<uint64_t>(now_ns()));
+    const int64_t t_pub_send = now_ns();
+    write_slot(payload, Slot::TS, static_cast<uint64_t>(t_pub_send));
+    return t_pub_send;
 }
 
 // Stamp current time into the given slot in-place.

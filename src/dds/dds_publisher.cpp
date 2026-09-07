@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "common/bench_util.hpp"
+#include "dds/dds_qos_apply.hpp"
 #include "ros2_msg_data_converter.hpp"
 
 DDSPublisher::DDSPublisher(eprosima::fastdds::dds::DomainParticipant* participant,
@@ -38,9 +39,11 @@ void DDSPublisher::stop() {
         for (auto& [key, worker] : worker_threads_) {
             if (!worker) continue;
             worker->stop_flag->store(true);
-            // Wake the blocked pop() with a dummy push (poison pill).
+            // Wake the blocked pop() with a poison pill. push_wakeup(), not
+            // push(): a bounded queue would evict a real sample to admit a
+            // sentinel and charge it to drop_total.
             if (auto q = queue_map_->get(key)) {
-                q->push(std::vector<uint8_t>{});
+                q->push_wakeup();
             }
             if (worker->thread.joinable()) {
                 worker->thread.join();
@@ -67,6 +70,7 @@ void DDSPublisher::stop() {
             }
         }
         writers_.clear();
+        listeners_.clear();  // safe only after every writer is gone
 
         participant_->delete_publisher(publisher_);
         publisher_ = nullptr;
@@ -103,6 +107,14 @@ bool DDSPublisher::handleCreate(const Command& cmd) {
     }
     writer_qos.history().depth = 10;
 
+    // Fine-grained policies, if this mapping declared any for its sink leg.
+    // Applied after the coarse `qos` above so an explicit reliability wins, and
+    // skipped entirely when nothing was declared.
+    if (!cmd.qos_policies.empty()) {
+        dds_qos::apply(writer_qos, cmd.qos_policies);
+        log_->info("Creating: QoS on sink leg: {}", dds_qos::describe(cmd.qos_policies));
+    }
+
     eprosima::fastdds::dds::Topic* topic = tracker_->getTopicAndAddRef(topic_name);
     if (topic == nullptr) {
         // Topic might already exist on the participant (e.g. created by a
@@ -124,12 +136,25 @@ bool DDSPublisher::handleCreate(const Command& cmd) {
         }
     }
 
-    eprosima::fastdds::dds::DataWriter* writer = publisher_->create_datawriter(topic, writer_qos);
+    // Attach the QoS listener only when this mapping declared something. A
+    // mapping that declared nothing keeps the plain create_datawriter call
+    // exactly, which matters because these callbacks log, and spdlog's async
+    // queue blocks when full -- a stray discovery event during a measurement
+    // run should not be able to touch the send path.
+    std::shared_ptr<WriterListener> listener;
+    if (!cmd.qos_policies.empty()) {
+        listener = std::make_shared<WriterListener>(conn_key, log_);
+    }
+    eprosima::fastdds::dds::DataWriter* writer =
+        publisher_->create_datawriter(topic, writer_qos, listener ? listener.get() : nullptr);
     if (writer == nullptr) {
         log_->error("Creating: FAILED: Could not create DataWriter for '{}'", topic_name);
         return false;
     }
 
+    if (listener) {
+        listeners_[conn_key] = listener;
+    }
     writers_[conn_key] = writer;
     tracker_->addPubTopic(topic_name);
 
@@ -155,7 +180,9 @@ bool DDSPublisher::handleDelete(const Command& cmd) {
 
     worker_threads_[conn_key]->stop_flag->store(true);
     if (auto queue = queue_map_->get(conn_key)) {
-        queue->push(std::vector<uint8_t>{});
+        // push_wakeup(), not push(): a bounded queue would evict a real sample
+        // to admit the sentinel and count it as a policy drop.
+        queue->push_wakeup();
     }
     if (worker_threads_[conn_key]->thread.joinable()) {
         worker_threads_[conn_key]->thread.join();
@@ -165,6 +192,7 @@ bool DDSPublisher::handleDelete(const Command& cmd) {
     if (writers_.count(conn_key)) {
         publisher_->delete_datawriter(writers_[conn_key]);
         writers_.erase(conn_key);
+        listeners_.erase(conn_key);  // the writer held a raw pointer to it
     }
 
     eprosima::fastdds::dds::Topic* topic_to_delete = nullptr;
@@ -226,6 +254,10 @@ void DDSPublisher::publisherWorker(Command cmd, std::shared_ptr<std::atomic<bool
         }
         auto queue_latency_us =
             std::chrono::duration_cast<std::chrono::microseconds>(t_bytes_leave - data_box.timestamp).count();
+        // Hand the queue the dwell it just computed: one relaxed add, no extra
+        // clock read. The queue owns the aggregate because it is the only thing
+        // that also knows the depth the message waited behind.
+        data_queue->record_dwell_us(static_cast<uint64_t>(queue_latency_us));
 
         auto t_conv_start = std::chrono::steady_clock::now();
         bool conv_ok = DataConverter::payloadToMsg(cmd.message_type, data_box.data, msg_object);
@@ -257,6 +289,34 @@ void DDSPublisher::publisherWorker(Command cmd, std::shared_ptr<std::atomic<bool
     }
 
     type_support.get()->deleteData(msg_object);
+}
+
+void DDSPublisher::WriterListener::on_offered_incompatible_qos(
+    eprosima::fastdds::dds::DataWriter* /*writer*/,
+    const eprosima::fastdds::dds::OfferedIncompatibleQosStatus& status) {
+    // A reader rejected what this bridge offers. Nothing will be delivered to
+    // it, and from the outside that is indistinguishable from no reader at all.
+    log_->error("[QoS:{}] OFFERED_INCOMPATIBLE_QOS on {} -- a reader requests more than this writer offers (count {})",
+                conn_key_, dds_qos::policyName(status.last_policy_id), status.total_count);
+}
+
+void DDSPublisher::WriterListener::on_offered_deadline_missed(
+    eprosima::fastdds::dds::DataWriter* /*writer*/,
+    const eprosima::fastdds::dds::OfferedDeadlineMissedStatus& status) {
+    // The gateway offered a period it did not keep -- meaning the sink leg is
+    // draining slower than the contract. Counted, not repaired: DDS deadline is
+    // a notification policy, and so is ours.
+    log_->warn("[QoS:{}] DEADLINE missed on the sink leg (total {})", conn_key_, status.total_count);
+}
+
+void DDSPublisher::WriterListener::on_liveliness_lost(
+    eprosima::fastdds::dds::DataWriter* /*writer*/,
+    const eprosima::fastdds::dds::LivelinessLostStatus& status) {
+    // Built AUTOMATIC with no lease (dds_qos::applyLiveliness), so this fires
+    // only if the participant itself stops asserting; kept so that it is
+    // visible if it ever does.
+    log_->warn("[QoS:{}] LIVELINESS lost -- this writer's participant stopped asserting (total {})", conn_key_,
+               status.total_count);
 }
 
 std::string DDSPublisher::qosToString(Qos qos) {

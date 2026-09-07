@@ -3,6 +3,7 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include "common/bench_util.hpp"
+#include "someip/someip_qos_apply.hpp"
 
 SomeipServer::SomeipServer(std::shared_ptr<vsomeip::application> app, std::shared_ptr<SomeipResourceTracker> tracker,
                            ConnectionQueueMap* queue_map)
@@ -29,8 +30,11 @@ void SomeipServer::stop() {
         for (auto& [key, worker] : worker_threads_) {
             if (!worker) continue;
             worker->stop_flag->store(true);
+            // Wake the blocked pop() with a poison pill. push_wakeup(), not
+            // push(): a bounded queue would evict a real sample to admit a
+            // sentinel and charge it to drop_total.
             if (auto q = queue_map_->get(key)) {
-                q->push(std::vector<uint8_t>{});
+                q->push_wakeup();
             }
             if (worker->thread.joinable()) {
                 worker->thread.join();
@@ -85,8 +89,53 @@ bool SomeipServer::handleCreate(const Command& cmd) {
 
     if (is_new_event) {
         std::set<vsomeip::eventgroup_t> groups{g_id};
-        app_->offer_event(s_id, i_id, e_id, groups);
+
+        // offer_event has six optional arguments and this leg used to pass
+        // none. Two of them carry policies, and only those two are filled: the
+        // event type (ET_FIELD retains the current value for a late subscriber)
+        // and the reliability (RT_RELIABLE selects the TCP endpoint). `_cycle`
+        // is left at zero on purpose -- see someip_qos_apply.hpp.
+        const auto ev_type = someip_qos::eventType(cmd.qos_policies);
+        const auto rel = someip_qos::reliability(cmd.qos_policies);
+        app_->offer_event(s_id, i_id, e_id, groups, ev_type, std::chrono::milliseconds::zero(), false, true, nullptr,
+                          rel);
+
+        if (!cmd.qos_policies.empty()) {
+            log_->info("Creating: QoS on sink leg: {}", someip_qos::describe(cmd.qos_policies));
+            if (ev_type == vsomeip::event_type_e::ET_FIELD) {
+                // vsomeip keeps one event type per (service, instance, event)
+                // and refuses a registration that disagrees ("Event
+                // registration update failed"), leaving whichever type was
+                // registered first in force. Measured on a single routing host:
+                // a mismatched pair still streams normally -- what is not in
+                // force is the type the later declaration asked for, and with
+                // it the retained-value behaviour ET_FIELD is declared for. So
+                // a durability declaration here is a statement about the peer
+                // too, and both sides have to make it.
+                log_->warn(
+                    "Creating: ET_FIELD on E:0x{:04x} requires the subscribing client to request it as a field "
+                    "too; if it requests ET_EVENT, vSomeIP refuses the second registration and the field "
+                    "semantics are not the ones declared",
+                    e_id);
+            }
+            if (rel == vsomeip::reliability_type_e::RT_RELIABLE) {
+                // vsomeip cannot invent a TCP endpoint. If the service has none
+                // declared, the offer silently falls back and the mapping is
+                // BEST_EFFORT while claiming otherwise -- worth saying out loud
+                // because it is the one place this leg can quietly under-deliver.
+                log_->warn(
+                    "Creating: RT_RELIABLE needs a TCP endpoint for S:0x{:04x} in VSOMEIP_CONFIG_PATH; "
+                    "without one this event stays on UDP",
+                    s_id);
+            }
+        }
     }
+
+    // The "the SD offer is per instance" caveat for a declared liveliness is
+    // raised by DiscoveryManager, not here: is_new_instance is false for every
+    // sink mapping because DiscoveryManager pre-offers the instance for service
+    // discovery, so this is not the place that can tell whether the instance
+    // really carries more than one mapping.
     if (is_new_instance) {
         app_->offer_service(s_id, i_id);
     }
@@ -123,7 +172,8 @@ bool SomeipServer::handleDelete(const Command& cmd) {
     if (it != worker_threads_.end()) {
         it->second->stop_flag->store(true);
         if (auto q = queue_map_->get(conn_key)) {
-            q->push(std::vector<uint8_t>{});
+            // push_wakeup(), not push(): see the note on ConnectionQueue.
+            q->push_wakeup();
         } else {
             log_->error("Deleting: Queue not found for key '{}' - worker may hang!", conn_key);
         }
@@ -169,6 +219,13 @@ void SomeipServer::serverWorker(Command cmd, std::shared_ptr<std::atomic<bool>> 
         return;
     }
 
+    // NOTE: SOME/IP reliability is the transport: UDP is best-effort, TCP is
+    //       reliable. offer_event() takes a reliability_type_e and handleCreate
+    //       passes RT_RELIABLE when the sink leg declares it. What vsomeip
+    //       cannot do is invent an endpoint: the service still needs a TCP port
+    //       in VSOMEIP_CONFIG_PATH, and handleCreate warns when a mapping asks
+    //       for RT_RELIABLE without one.
+
     while (running_ && !stop_flag->load()) {
         DataType data_box = data_queue->pop();
         if (!running_ || stop_flag->load() || data_box.data.empty()) break;
@@ -178,6 +235,10 @@ void SomeipServer::serverWorker(Command cmd, std::shared_ptr<std::atomic<bool>> 
         auto t_bytes_leave = std::chrono::steady_clock::now();
         auto queue_latency_us =
             std::chrono::duration_cast<std::chrono::microseconds>(t_bytes_leave - data_box.timestamp).count();
+        // Hand the queue the dwell it just computed: one relaxed add, no extra
+        // clock read. The queue owns the aggregate because it is the only thing
+        // that also knows the depth the message waited behind.
+        data_queue->record_dwell_us(static_cast<uint64_t>(queue_latency_us));
 
         uint64_t bench_seq_key = 0;
         if (cmd.bench_mode) {

@@ -4,6 +4,7 @@
 
 #include "common/bench_util.hpp"
 #include "common/zenoh_liveliness.hpp"
+#include "zenoh/zenoh_qos_apply.hpp"
 
 ZenohPublisher::ZenohPublisher(std::shared_ptr<zenoh::Session> session, std::shared_ptr<ZenohResourceTracker> tracker,
                                ConnectionQueueMap* queue_map)
@@ -30,8 +31,11 @@ void ZenohPublisher::stop() {
         for (auto& [key, worker] : worker_threads_) {
             if (!worker) continue;
             worker->stop_flag->store(true);
+            // Wake the blocked pop() with a poison pill. push_wakeup(), not
+            // push(): a bounded queue would evict a real sample to admit a
+            // sentinel and charge it to drop_total.
             if (auto q = queue_map_->get(key)) {
-                q->push(std::vector<uint8_t>{});
+                q->push_wakeup();
             }
             if (worker->thread.joinable()) {
                 worker->thread.join();
@@ -70,9 +74,59 @@ bool ZenohPublisher::handleCreate(const Command& cmd) {
         return false;
     }
 
+    // Create new publisher.
+    //
+    // Which one depends on what the mapping declared. z_publisher_options_t has
+    // a `reliability` field, but the upstream header is explicit that it "does
+    // not trigger any data retransmission on the wire" -- it is an attribute
+    // carried on the sample. The mechanism that actually recovers a lost sample
+    // is the Advanced Publisher's cache plus sample-miss detection, so a leg
+    // that declared RELIABLE (or history, durability, liveliness) gets that
+    // instead. A leg that declared none of them keeps the plain publisher this
+    // gateway creates by default.
+    log_->trace("Creating: New Zenoh publisher: '{}'", zenoh_key);
     try {
-        auto publisher = session_->declare_publisher(zenoh_key);
-        publishers_[zenoh_key] = std::make_unique<zenoh::Publisher>(std::move(publisher));
+        if (zenoh_qos::needsAdvancedPublisher(cmd.qos_policies)) {
+            auto opts = zenoh_qos::buildPublisherOptions(cmd.qos_policies);
+            auto publisher = session_->ext().declare_advanced_publisher(zenoh_key, std::move(opts));
+            publishers_[zenoh_key] = std::make_unique<PublisherHandle>(std::move(publisher));
+            log_->info("Creating: AdvancedPublisher created: '{}' [{}]", zenoh_key,
+                       zenoh_qos::describePublisher(cmd.qos_policies));
+        } else {
+            auto publisher = session_->declare_publisher(zenoh_key);
+            publishers_[zenoh_key] = std::make_unique<PublisherHandle>(std::move(publisher));
+            log_->debug("Creating: Publisher created: '{}' (QoS: {})", zenoh_key, qosToString(cmd.qos));
+        }
+
+        // LIVELINESS QoS, on the leg where this gateway is the writer. This is
+        // the policy token on the mapping's own key expression -- not the
+        // "@mpg" discovery token declared further down, which announces this
+        // gateway to peer gateways and is always present.
+        //
+        // AdvancedPublisher's publisher_detection makes this publisher visible
+        // to a subscriber that is looking; it is not an assertion of liveness
+        // and it is not what a DDS DataWriter offers. The assertion is a
+        // liveliness token: while it is declared the peers see a PUT on its key
+        // expression, and the moment it is undeclared -- or the session drops
+        // -- they get a DELETE. That is the counterpart of a lease expiring,
+        // and it is why this is declared here rather than being inferred from
+        // the Advanced options.
+        //
+        // The token's key expression is the mapping's own, so a peer that
+        // subscribes to liveliness on the key it already reads from finds it
+        // without being told a second name.
+        //
+        // Its lifetime is the bridge's: DiscoveryManager deletes the bridge
+        // when the source's own assertion is withdrawn, the handle below goes
+        // with it, and the DELETE the peer then sees is the source's loss
+        // carried across. Nothing here has to know why the bridge went away.
+        if (cmd.qos_policies.liveliness) {
+            auto& handle = publishers_[zenoh_key];
+            handle->adopt_liveliness(session_->liveliness_declare_token(zenoh::KeyExpr(zenoh_key)));
+            log_->info("[QoS:{}] LIVELINESS: token declared on '{}'; peers see a DELETE when it is undeclared or "
+                       "the session drops",
+                       conn_key, zenoh_key);
+        }
     } catch (const std::exception& e) {
         log_->error("Creating: FAILED: Exception while creating publisher '{}': {}", zenoh_key, e.what());
         return false;
@@ -114,7 +168,9 @@ bool ZenohPublisher::handleDelete(const Command& cmd) {
 
     worker_threads_[conn_key]->stop_flag->store(true);
     if (auto queue = queue_map_->get(conn_key)) {
-        queue->push(std::vector<uint8_t>{});
+        // push_wakeup(), not push(): a bounded queue would evict a real sample
+        // to admit the sentinel and count it as a policy drop.
+        queue->push_wakeup();
     }
     if (worker_threads_[conn_key]->thread.joinable()) {
         worker_threads_[conn_key]->thread.join();
@@ -149,7 +205,7 @@ void ZenohPublisher::publisherWorker(Command cmd, std::shared_ptr<std::atomic<bo
         return;
     }
 
-    zenoh::Publisher* publisher = nullptr;
+    PublisherHandle* publisher = nullptr;
     {
         std::lock_guard<std::mutex> lock(resource_mutex_);
         auto it = publishers_.find(zenoh_key);
@@ -168,6 +224,10 @@ void ZenohPublisher::publisherWorker(Command cmd, std::shared_ptr<std::atomic<bo
         auto t_bytes_leave = std::chrono::steady_clock::now();
         auto queue_latency_us =
             std::chrono::duration_cast<std::chrono::microseconds>(t_bytes_leave - data_box.timestamp).count();
+        // Hand the queue the dwell it just computed: one relaxed add, no extra
+        // clock read. The queue owns the aggregate because it is the only thing
+        // that also knows the depth the message waited behind.
+        data_queue->record_dwell_us(static_cast<uint64_t>(queue_latency_us));
 
         // Bench (Zenoh): no msg-object conversion. Stamp T_BYTES_LEAVE and
         // capture seq_key before publisher->put() moves data_box.data.

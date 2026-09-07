@@ -4,6 +4,7 @@
 
 #include "common/bench_util.hpp"
 #include "common/zenoh_liveliness.hpp"
+#include "zenoh/zenoh_qos_apply.hpp"
 
 ZenohSubscriber::ZenohSubscriber(std::shared_ptr<zenoh::Session> session, std::shared_ptr<ZenohResourceTracker> tracker,
                                  ConnectionQueueMap* queue_map)
@@ -82,8 +83,51 @@ bool ZenohSubscriber::handleCreate(const Command& cmd) {
         };
 
         auto on_drop = []() {};
-        auto subscriber = session_->declare_subscriber(zenoh_key, std::move(on_sample), std::move(on_drop));
-        subscribers_[conn_key] = std::make_unique<zenoh::Subscriber<void>>(std::move(subscriber));
+
+        // A leg that declared recovery, late-joiner history or liveliness needs
+        // the Advanced Subscriber; anything else keeps the plain one. Note that a declared HISTORY does not put
+        // us here: the subscriber's history option queries a publisher's cache
+        // for past data, which is durability, and receive-side depth on this
+        // leg is the bridge queue's job.
+        SubscriberEntry entry;
+        if (zenoh_qos::needsAdvancedSubscriber(cmd.qos_policies)) {
+            auto opts = zenoh_qos::buildSubscriberOptions(cmd.qos_policies);
+            auto subscriber = session_->ext().declare_advanced_subscriber(zenoh_key, std::move(on_sample),
+                                                                          std::move(on_drop), std::move(opts));
+            entry.advanced = std::make_unique<zenoh::ext::AdvancedSubscriber<void>>(std::move(subscriber));
+
+            if (cmd.qos_policies.reliability && *cmd.qos_policies.reliability == ReliabilityKind::RELIABLE) {
+                // The Zenoh counterpart of the DDS violation callbacks. Recovery
+                // re-queries the publisher's cache for a detected gap; this
+                // reports the gaps that were detected, so a leg that declares
+                // reliability can say how often it had to recover rather than
+                // asserting that it never lost anything.
+                auto log = log_;
+                auto key = conn_key;
+                auto miss = entry.advanced->declare_sample_miss_listener(
+                    [log, key](const zenoh::ext::Miss& m) {
+                        log->warn("[QoS:{}] RELIABILITY: {} sample(s) missed from one publisher, recovery requested",
+                                  key, m.nb);
+                    },
+                    []() {});
+                entry.miss = std::make_unique<zenoh::ext::SampleMissListener<void>>(std::move(miss));
+            }
+            log_->info("Creating: AdvancedSubscriber created: '{}' [{}]", zenoh_key,
+                       zenoh_qos::describeSubscriber(cmd.qos_policies));
+        } else {
+            auto subscriber = session_->declare_subscriber(zenoh_key, std::move(on_sample), std::move(on_drop));
+            entry.plain = std::make_unique<zenoh::Subscriber<void>>(std::move(subscriber));
+            log_->debug("Creating: Subscriber created: '{}' (QoS: {})", zenoh_key, qosToString(cmd.qos));
+        }
+
+        // The LIVELINESS QoS policy is not declared on this leg. The peer's
+        // token is watched by DiscoveryManager, because the token is what
+        // brings this subscriber into existence and takes it away again; by the
+        // time handleCreate runs, the token has already been seen. The
+        // discovery token declared just below is a different thing: it lives
+        // under "@mpg" and announces this gateway to peer gateways.
+
+        subscribers_[conn_key] = std::move(entry);
     } catch (const std::exception& e) {
         log_->error("Creating: FAILED: Exception while creating subscriber '{}': {}", zenoh_key, e.what());
         return false;

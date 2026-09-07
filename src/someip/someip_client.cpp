@@ -6,6 +6,7 @@
 #include <set>
 
 #include "common/bench_util.hpp"
+#include "someip/someip_qos_apply.hpp"
 
 SomeipClient::SomeipClient(std::shared_ptr<vsomeip::application> app, std::shared_ptr<SomeipResourceTracker> tracker,
                            ConnectionQueueMap* queue_map)
@@ -75,7 +76,29 @@ bool SomeipClient::handleCreate(const Command& cmd) {
 
     if (is_new_event) {
         std::set<vsomeip::eventgroup_t> groups{g_id};
-        app_->request_event(s_id, i_id, e_id, groups, vsomeip::event_type_e::ET_EVENT);
+
+        // request_event carries exactly two policies, and this leg used to fill
+        // neither: ET_FIELD asks the server for its retained current value on
+        // subscribe (TRANSIENT_LOCAL, depth one, fixed), and reliability_type_e
+        // picks the transport. No history depth is read on this leg -- a vsomeip
+        // event stores one current payload plus one staging slot, so there is no
+        // depth to ask for (someip_qos_apply.hpp); the declared depth bounds the
+        // bridge queue and nothing here.
+        const auto ev_type = someip_qos::eventType(cmd.qos_policies);
+        const auto rel = someip_qos::reliability(cmd.qos_policies);
+        app_->request_event(s_id, i_id, e_id, groups, ev_type, rel);
+
+        if (!cmd.qos_policies.empty()) {
+            log_->info("Creating: QoS on source leg: {}", someip_qos::describe(cmd.qos_policies));
+            if (cmd.qos_policies.liveliness) {
+                // Reported from DiscoveryManager's existing availability handler
+                // rather than a second registration: vsomeip keeps one handler
+                // per service and a QoS-specific one would replace the handler
+                // the bridge lifecycle depends on.
+                log_->info("Creating: LIVELINESS observed via service-discovery availability (service scope)");
+            }
+        }
+
         app_->register_message_handler(
             s_id, i_id, e_id,
             std::bind(&SomeipClient::onMessageReceived, this, std::placeholders::_1, queue_map_, cmd, log_));

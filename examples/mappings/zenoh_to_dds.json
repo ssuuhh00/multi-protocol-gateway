@@ -7,6 +7,12 @@
       "qos": "RELIABLE",
       "topic": "rt/example_z2d",
       "zenoh_key": "example/z2d",
+      "qos_policies": {
+        "reliability": "RELIABLE",
+        "history": { "kind": "KEEP_LAST", "depth": 16 },
+        "durability": "TRANSIENT_LOCAL",
+        "liveliness": true
+      },
       "bench_mode": true
     }
   ]

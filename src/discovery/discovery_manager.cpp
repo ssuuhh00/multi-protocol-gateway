@@ -2,13 +2,17 @@
 
 #include <spdlog/sinks/stdout_color_sinks.h>
 
+#include <algorithm>
 #include <cctype>
+#include <iomanip>
 #include <set>
 #include <sstream>
 #include <utility>
 
+#include "common/conn_key_util.hpp"
 #include "common/zenoh_liveliness.hpp"
 #include "gateway/gateway_core.hpp"
+#include "someip/someip_qos_apply.hpp"
 
 DiscoveryManager::DiscoveryManager(eprosima::fastdds::dds::DomainParticipant* dds_participant,
                                    std::shared_ptr<vsomeip::application> someip_app,
@@ -34,6 +38,20 @@ DiscoveryManager::DiscoveryManager(eprosima::fastdds::dds::DomainParticipant* dd
         log_->debug("Init: Self Zenoh ZID = {}", self_zid_hex_);
     }
 
+    // Key expressions on which this gateway will declare a LIVELINESS QoS token
+    // of its own (a Zenoh sink that declared liveliness). A Zenoh SOURCE that
+    // declared liveliness on the same key expression would count that token as
+    // its peer's -- a liveliness sample carries no source id to tell them apart
+    // -- and the bridge would hold itself up. Such a mapping is refused below.
+    // This does not apply to the "@mpg" discovery tokens, which carry the
+    // declaring session's zid and are self-filtered by isSelfZid().
+    std::set<std::string> own_token_keys;
+    for (const auto& m : mappings) {
+        if (m.cmd_template.sink == ProtocolType::ZENOH && m.cmd_template.qos_policies.liveliness) {
+            own_token_keys.insert(m.cmd_template.zenoh_key);
+        }
+    }
+
     for (size_t idx = 0; idx < mappings.size(); ++idx) {
         auto m = mappings[idx];
 
@@ -41,21 +59,46 @@ DiscoveryManager::DiscoveryManager(eprosima::fastdds::dds::DomainParticipant* dd
             continue;
         }
 
+        if (m.cmd_template.source == ProtocolType::ZENOH && m.cmd_template.qos_policies.liveliness &&
+            own_token_keys.count(m.cmd_template.zenoh_key)) {
+            log_->error(
+                "[Validate] Mapping[{}] FAILED: Zenoh source declares liveliness on '{}', and another mapping "
+                "declares liveliness on a Zenoh SINK with the same key expression. The gateway's own token there "
+                "cannot be told from the peer's, so this source would never be seen as lost. Use a different key "
+                "expression for one of them, or declare liveliness on only one of the two mappings",
+                idx, m.cmd_template.zenoh_key);
+            continue;
+        }
+
         MappingState state;
         state.mapping = m;
+        state.map_idx = idx;
 
         // source_condition false means "waiting for external endpoint":
         //   DDS src    -> external DDS Writer
         //   SOMEIP src -> external SOME/IP Server availability
-        //   ZENOH src  -> external Zenoh publisher liveliness
+        //   ZENOH src  -> external Zenoh publisher's "@mpg/pub" discovery token,
+        //                 and additionally its LIVELINESS QoS token on the data
+        //                 key expression when the mapping declared liveliness.
+        //                 Those are two separate assertions on two separate
+        //                 callbacks, so each is tracked on its own field and
+        //                 source_condition is their conjunction.
         switch (m.cmd_template.source) {
             case ProtocolType::DDS:
             case ProtocolType::SOMEIP:
+                state.source_condition = false;
+                break;
             case ProtocolType::ZENOH:
+                state.zenoh_src_discovered = false;
+                if (m.cmd_template.qos_policies.liveliness) {
+                    state.zenoh_src_liveliness = false;
+                    log_->trace("  Mapping[{}] source=ZENOH (wait for a liveliness token on '{}')", idx,
+                                m.cmd_template.zenoh_key);
+                }
                 state.source_condition = false;
                 break;
             default:
-                state.source_condition = true;
+                state.source_condition = true;  // NONE
                 break;
         }
 
@@ -148,10 +191,47 @@ void DiscoveryManager::start() {
 
             if (is_new_event) {
                 std::set<vsomeip::eventgroup_t> groups{gid};
-                someip_app_->offer_event(sid, iid, eid, groups);
+                // This pre-offer is the FIRST registration of the event, and
+                // vsomeip keeps one event type per (service, instance, event):
+                // a later offer_event with different arguments is refused
+                // ("Event registration update failed"), leaving whatever was
+                // registered here in force. So it must carry the mapping's
+                // declared policies, not the defaults -- otherwise the sink leg
+                // is quietly ET_EVENT/UDP while the spec sheet reports the
+                // declared DURABILITY and RELIABILITY as carried. SomeipServer
+                // builds the same two values from the same mapping; its own
+                // offer_event is a no-op behind the tracker's refcount.
+                someip_app_->offer_event(sid, iid, eid, groups, someip_qos::eventType(cmd.qos_policies),
+                                         std::chrono::milliseconds::zero(), false, true, nullptr,
+                                         someip_qos::reliability(cmd.qos_policies));
             }
             if (is_new_instance) {
                 someip_app_->offer_service(sid, iid);
+            }
+
+            if (cmd.qos_policies.liveliness) {
+                // The SD offer is per service instance and is withdrawn only
+                // when the last mapping on the instance goes. A subscriber
+                // therefore learns of THIS mapping's source loss through
+                // availability only if the mapping is the instance's only one.
+                // Counted from the mapping file, which is the only place the
+                // answer exists -- SomeipServer cannot tell, because the
+                // pre-offer above already took the instance's first reference.
+                size_t on_instance = 0;
+                for (const auto& other : states_) {
+                    const auto& o = other.mapping.cmd_template;
+                    if (o.sink == ProtocolType::SOMEIP && o.service_id.value_or(0) == sid &&
+                        o.instance_id.value_or(0) == iid) {
+                        ++on_instance;
+                    }
+                }
+                if (on_instance > 1) {
+                    log_->warn(
+                        "[SOMEIP sink] LIVELINESS declared on S:0x{:04x} I:0x{:04x}, which carries {} mappings; "
+                        "the SD offer is withdrawn only when the last of them goes, so a subscriber sees this "
+                        "source's loss through availability only if this mapping is the instance's only one",
+                        sid, iid, on_instance);
+                }
             }
 
             if (someip_sub_handler_keys_.insert(eg_key).second) {
@@ -221,6 +301,46 @@ void DiscoveryManager::start() {
     }
     log_->debug("Start: Zenoh liveliness subscribers registered ({} key(s))", zenoh_sub_count);
 
+    // LIVELINESS QoS watchers -- the second, optional gate on a Zenoh source,
+    // on the mapping's own key expression rather than the "@mpg" namespace the
+    // discovery subscribers above use.
+    //
+    // The source-side half of the liveliness contract on a Zenoh leg. It lives
+    // here and not in ZenohSubscriber because it decides whether the bridge --
+    // and so the subscriber -- exists at all; a watcher created by the bridge
+    // could never see the token that has to arrive first. One subscriber per
+    // key expression, shared by every mapping that reads from it.
+    //
+    // history=true is load-bearing: a gateway that starts after its peer would
+    // otherwise never learn the peer is there, and that ordering is the usual
+    // one, not the exception.
+    int watcher_count = 0;
+    if (zenoh_session_) {
+        for (const auto& s : states_) {
+            const auto& cmd = s.mapping.cmd_template;
+            if (cmd.source != ProtocolType::ZENOH || !cmd.qos_policies.liveliness) continue;
+            const std::string key = cmd.zenoh_key;
+            if (zenoh_liveliness_.count(key)) continue;
+            try {
+                zenoh::Session::LivelinessSubscriberOptions opts;
+                opts.history = true;
+                auto sub = zenoh_session_->liveliness_declare_subscriber(
+                    zenoh::KeyExpr(key),
+                    [this, key](const zenoh::Sample& sample) {
+                        this->onZenohPeerLiveliness(key, sample.get_kind() == Z_SAMPLE_KIND_PUT);
+                    },
+                    []() {}, std::move(opts));
+                zenoh_liveliness_[key] = std::make_unique<zenoh::Subscriber<void>>(std::move(sub));
+                log_->debug("[QoS:{}] LIVELINESS: liveliness subscriber declared on '{}'", make_conn_key(cmd), key);
+                ++watcher_count;
+            } catch (const std::exception& e) {
+                log_->error("Start: liveliness subscriber on '{}' failed: {} -- mapping stays waiting", key,
+                            e.what());
+            }
+        }
+    }
+    log_->debug("Start: Zenoh LIVELINESS QoS watchers declared ({} key expression(s))", watcher_count);
+
     // Explicit initial evaluation for mappings whose conditions are already true.
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -280,6 +400,13 @@ void DiscoveryManager::stop() {
     // guarantees no new mutex_ acquisition by the Zenoh thread after this point.
     liveliness_subs_.clear();
 
+
+    // Zenoh LIVELINESS QoS watchers go here too, while the session is still open
+    // (GatewayCore::shutdown() closes it in Phase 3). Undeclaring joins a
+    // callback that is still running; that callback only needs mutex_, which is
+    // not held here, so there is nothing for it to wait on.
+    zenoh_liveliness_.clear();
+
     { std::lock_guard<std::mutex> lock(mutex_); }
 
     // Wake the dispatch thread so it can observe running_=false and exit.
@@ -315,6 +442,17 @@ bool DiscoveryManager::isSelfOfferedService(vsomeip::service_t sid, vsomeip::ins
     return inst_it->second.server_count > 0;
 }
 
+// Fold a Zenoh source's two assertions -- the peer's "@mpg/pub" discovery token
+// and, when declared, its LIVELINESS QoS token on the data key expression --
+// into source_condition. Callers set one field and call this; neither callback
+// writes source_condition itself, so the later of the two cannot mask the other.
+bool DiscoveryManager::refreshZenohSource(MappingState& state) {
+    const bool ready = state.zenoh_src_discovered && state.zenoh_src_liveliness;
+    if (state.source_condition == ready) return false;
+    state.source_condition = ready;
+    return true;
+}
+
 void DiscoveryManager::onDdsWriterDiscovered(const std::string& topic, bool alive) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!running_.load(std::memory_order_acquire)) return;
@@ -328,6 +466,20 @@ void DiscoveryManager::onDdsWriterDiscovered(const std::string& topic, bool aliv
         if (state.source_condition != alive) {
             state.source_condition = alive;
             changed = true;
+
+            // The DDS source's assertion is the writer's presence in discovery.
+            // The gateway's reader carries no liveliness lease, so
+            // on_liveliness_changed never fires for it; a removed writer --
+            // deleted, or its participant's lease expired -- is the signal, and
+            // this is where it is reported as the contract event.
+            if (state.mapping.cmd_template.qos_policies.liveliness) {
+                const std::string key = make_conn_key(state.mapping.cmd_template);
+                if (alive) {
+                    log_->info("[QoS:{}] LIVELINESS: DDS writer present on '{}'", key, topic);
+                } else {
+                    log_->warn("[QoS:{}] LIVELINESS lost: DDS writer removed from '{}'", key, topic);
+                }
+            }
         }
     }
     if (changed) evaluateMappings();
@@ -358,8 +510,11 @@ void DiscoveryManager::onSomeipAvailability(vsomeip::service_t sid, vsomeip::ins
 
     std::lock_guard<std::mutex> lock(mutex_);
     if (!running_.load(std::memory_order_acquire)) return;
-    log_->info("[SOMEIP] Service 0x{:04x}:0x{:04x} {}", sid, iid, available ? "available" : "unavailable");
 
+    // Logged after the loop, not here: vsomeip delivers an "unavailable"
+    // callback when the handler is registered, before the service has ever been
+    // up, and reporting that at info makes a healthy startup read like a fault.
+    // What is worth a line is a transition.
     bool changed = false;
     for (size_t i = 0; i < states_.size(); ++i) {
         auto& state = states_[i];
@@ -371,10 +526,34 @@ void DiscoveryManager::onSomeipAvailability(vsomeip::service_t sid, vsomeip::ins
             if (state.source_condition != available) {
                 state.source_condition = available;
                 changed = true;
+
+                // A mapping that declared liveliness on its SOME/IP source gets
+                // this transition reported as the contract event it is. There is
+                // no second handler to register: vsomeip keeps one availability
+                // handler per service, this one owns it, and a QoS-specific
+                // registration would silently replace it and break the bridge
+                // lifecycle. Service-discovery availability *is* the liveness
+                // signal on this leg -- at service scope, not per event, which
+                // is the honest limit of the mapping.
+                if (cmd.qos_policies.liveliness) {
+                    if (available) {
+                        log_->info("[QoS:{}] LIVELINESS: SOME/IP service 0x{:04x}:0x{:04x} available",
+                                   make_conn_key(cmd), sid, iid);
+                    } else {
+                        log_->warn("[QoS:{}] LIVELINESS lost: SOME/IP service 0x{:04x}:0x{:04x} withdrawn",
+                                   make_conn_key(cmd), sid, iid);
+                    }
+                }
             }
         }
     }
-    if (changed) evaluateMappings();
+    if (changed) {
+        log_->info("[SOMEIP] Service 0x{:04x}:0x{:04x} {}", sid, iid, available ? "available" : "unavailable");
+        evaluateMappings();
+    } else {
+        log_->debug("[SOMEIP] Service 0x{:04x}:0x{:04x} {} (no mapping changed)", sid, iid,
+                    available ? "available" : "unavailable");
+    }
 }
 
 // Fires from a vSomeIP thread when an external client (un)subscribes to one of
@@ -414,6 +593,22 @@ void DiscoveryManager::onSomeipSubscription(vsomeip::client_t client, vsomeip::s
         if (state.sink_condition != now_active) {
             state.sink_condition = now_active;
             changed = true;
+
+            // A mapping that declared liveliness on its SOME/IP sink gets this
+            // transition reported as the contract event it is. Like the source
+            // side's availability handler, this is reported from the handler
+            // that already exists rather than a second registration: vsomeip
+            // keeps one subscription handler per (service, instance,
+            // eventgroup), this one owns it, and registering another in
+            // SomeipServer would silently replace it and break sink discovery
+            // for every mapping on the eventgroup.
+            if (cmd.qos_policies.liveliness) {
+                if (now_active) {
+                    log_->info("[QoS:{}] LIVELINESS: subscriber present on G:0x{:04x}", make_conn_key(cmd), gid);
+                } else {
+                    log_->warn("[QoS:{}] LIVELINESS lost: last subscriber left G:0x{:04x}", make_conn_key(cmd), gid);
+                }
+            }
         }
     }
     if (changed) evaluateMappings();
@@ -429,10 +624,9 @@ void DiscoveryManager::onZenohPublisherDiscovered(const std::string& zenoh_key, 
         auto& state = states_[i];
         if (state.mapping.cmd_template.source != ProtocolType::ZENOH) continue;
         if (zenoh_key != state.mapping.cmd_template.zenoh_key) continue;
-        if (state.source_condition != alive) {
-            state.source_condition = alive;
-            changed = true;
-        }
+        if (state.zenoh_src_discovered == alive) continue;
+        state.zenoh_src_discovered = alive;
+        changed |= refreshZenohSource(state);
     }
     if (changed) evaluateMappings();
 }
@@ -453,6 +647,52 @@ void DiscoveryManager::onZenohSubscriberDiscovered(const std::string& zenoh_key,
         }
     }
     if (changed) evaluateMappings();
+}
+
+// LIVELINESS QoS: a source's token on the mapping's own key expression.
+// Distinct from onZenohPublisherDiscovered above, which watches the "@mpg"
+// discovery namespace; both gate the same mapping and both must hold.
+void DiscoveryManager::onZenohPeerLiveliness(const std::string& key, bool alive) {
+    if (!running_.load(std::memory_order_acquire)) return;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!running_.load(std::memory_order_acquire)) return;  // re-check after lock
+
+    // One PUT per token declared, one DELETE per token gone. The bridge follows
+    // "is any token declared", not the last event, so a second publisher on the
+    // same key expression leaving does not tear down a bridge the first one is
+    // still feeding.
+    int& n = zenoh_tokens_[key];
+    n = alive ? n + 1 : std::max(0, n - 1);
+    const bool present = n > 0;
+    log_->info("[Zenoh Token] {}: '{}' ({} declared)", alive ? "Declared" : "Undeclared", key, n);
+
+    bool changed = false;
+    for (size_t i = 0; i < states_.size(); ++i) {
+        auto& state = states_[i];
+        const auto& cmd = state.mapping.cmd_template;
+        if (cmd.source != ProtocolType::ZENOH || !cmd.qos_policies.liveliness) continue;
+        if (cmd.zenoh_key != key) continue;
+        if (state.zenoh_src_liveliness == present) continue;
+
+        state.zenoh_src_liveliness = present;
+        changed |= refreshZenohSource(state);
+
+        // Same wording as the other two sources' contract events.
+        if (present) {
+            log_->info("[QoS:{}] LIVELINESS: peer alive on '{}'", make_conn_key(cmd), key);
+        } else {
+            log_->warn("[QoS:{}] LIVELINESS: peer lost on '{}' (token undeclared or session dropped)",
+                       make_conn_key(cmd), key);
+        }
+    }
+
+    if (!changed) {
+        log_->trace("[Zenoh Token] No condition changed for '{}'", key);
+        return;
+    }
+
+    evaluateMappings();
 }
 
 bool DiscoveryManager::validateMapping(Command& cmd, size_t mapping_idx) {
@@ -555,6 +795,50 @@ bool DiscoveryManager::validateMapping(Command& cmd, size_t mapping_idx) {
 // re-entering Fast-DDS from inside a participant listener callback deadlocks
 // on the participant's internal listener mutex. Instead, mutate state and
 // enqueue a BridgeAction for the dispatch thread.
+namespace {
+
+// How an endpoint identifies itself in the mapping, per protocol. Matches what
+// the demo prints so the two can be read side by side.
+std::string addr_of(ProtocolType p, const Command& c) {
+    switch (p) {
+        case ProtocolType::DDS:
+            return c.topic;
+        case ProtocolType::ZENOH:
+            return c.zenoh_key;
+        case ProtocolType::SOMEIP: {
+            std::ostringstream os;
+            os << "S" << std::hex << std::setw(4) << std::setfill('0') << c.service_id.value_or(0) << ":E"
+               << std::setw(4) << std::setfill('0') << c.event_id.value_or(0);
+            return os.str();
+        }
+        default:
+            return "";
+    }
+}
+
+}  // namespace
+
+std::vector<MappingInfo> DiscoveryManager::snapshot() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<MappingInfo> out;
+    out.reserve(states_.size());
+    for (const auto& st : states_) {
+        const Command& c = st.mapping.cmd_template;
+        MappingInfo mi;
+        mi.map_idx = st.map_idx;
+        mi.conn_key = make_conn_key(c);
+        mi.source = c.source;
+        mi.sink = c.sink;
+        mi.src_addr = addr_of(c.source, c);
+        mi.sink_addr = addr_of(c.sink, c);
+        mi.source_condition = st.source_condition;
+        mi.sink_condition = st.sink_condition;
+        mi.is_active = st.is_active;
+        out.push_back(std::move(mi));
+    }
+    return out;
+}
+
 void DiscoveryManager::evaluateMappings() {
     for (size_t i = 0; i < states_.size(); ++i) {
         auto& state = states_[i];
