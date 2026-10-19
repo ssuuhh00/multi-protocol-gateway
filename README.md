@@ -5,6 +5,7 @@
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://isocpp.org/)
 [![Ubuntu 24.04](https://img.shields.io/badge/Ubuntu-24.04-orange.svg)](https://ubuntu.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![DOI](https://img.shields.io/badge/DOI-10.1109%2FACCESS.2026.3739371-blue.svg)](https://doi.org/10.1109/ACCESS.2026.3739371)
 
 A cloud-extended multi-protocol gateway that bridges **SOME/IP**, **DDS**, and **Zenoh** for autonomous driving and robotics applications. Enables seamless interoperability between legacy automotive in-vehicle networks and modern cloud-native middleware.
 
@@ -12,7 +13,7 @@ A cloud-extended multi-protocol gateway that bridges **SOME/IP**, **DDS**, and *
 
 </div>
 
-> **Paper**: S. Lee, H. Choi, and C. Moon, "A Cloud-extended Multi-Protocol Gateway for Software-Defined Vehicles: Bridging SOME/IP, DDS, and Zenoh," *IEEE Access*, to appear.
+> **Paper**: S. Lee, H. Choi, and C. Moon, "A Cloud-Extended Multiprotocol Gateway for Software-Defined Vehicles: Bridging SOME/IP, DDS, and Zenoh," *IEEE Access*, vol. 14, pp. 155905–155921, 2026, doi: [10.1109/ACCESS.2026.3739371](https://doi.org/10.1109/ACCESS.2026.3739371). (Open Access)
 
 ## Motivation
 
@@ -117,12 +118,14 @@ If you use this work, please cite:
 
 ```bibtex
 @article{lee2026gateway,
-  title     = {A Cloud-extended Multi-Protocol Gateway for Software-Defined Vehicles: Bridging SOME/IP, DDS, and Zenoh},
+  title     = {A Cloud-Extended Multiprotocol Gateway for Software-Defined Vehicles: Bridging {SOME/IP}, {DDS}, and {Zenoh}},
   author    = {Lee, Suhaeng and Choi, Hyeongju and Moon, Changjoo},
   journal   = {IEEE Access},
+  volume    = {14},
+  pages     = {155905--155921},
   year      = {2026},
   publisher = {IEEE},
-  note      = {to appear}
+  doi       = {10.1109/ACCESS.2026.3739371}
 }
 ```
 
