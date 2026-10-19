@@ -118,7 +118,7 @@ If you use this work, please cite:
 
 ```bibtex
 @article{lee2026gateway,
-  title     = {A Cloud-Extended Multiprotocol Gateway for Software-Defined Vehicles: Bridging {SOME/IP}, {DDS}, and {Zenoh}},
+  title     = {A Cloud-Extended Multiprotocol Gateway for Software-Defined Vehicles: Bridging SOME/IP, DDS, and Zenoh},
   author    = {Lee, Suhaeng and Choi, Hyeongju and Moon, Changjoo},
   journal   = {IEEE Access},
   volume    = {14},
